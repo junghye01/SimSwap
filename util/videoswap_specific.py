@@ -15,6 +15,11 @@ from util.norm import SpecificNorm
 import torch.nn.functional as F
 from parsing_model.model import BiSeNet
 
+import sys
+
+sys.path.append('/mnt/nas203/forGPU2/junghye/Deepfake_Disruption/AntiForgery')
+from utils import lab_attack_faceswap_video
+
 def _totensor(array):
     tensor = torch.from_numpy(array)
     img = tensor.transpose(0, 1).transpose(0, 2).contiguous()
@@ -84,7 +89,7 @@ def video_swap(video_path, id_vetor,specific_person_id_nonorm,id_thres, swap_mod
 
                     frame_align_crop_tenor_arcnorm = spNorm(frame_align_crop_tenor)
                     frame_align_crop_tenor_arcnorm_downsample = F.interpolate(frame_align_crop_tenor_arcnorm, size=(112,112))
-                    frame_align_crop_crop_id_nonorm = swap_model.netArc(frame_align_crop_tenor_arcnorm_downsample)
+                    frame_align_crop_crop_id_nonorm = swap_model.netArc(frame_align_crop_tenor_arcnorm_downsample) # swap 적용된 얼굴
 
                     id_compare_values.append(mse(frame_align_crop_crop_id_nonorm,specific_person_id_nonorm).detach().cpu().numpy())
                     frame_align_crop_tenor_list.append(frame_align_crop_tenor)
@@ -128,3 +133,74 @@ def video_swap(video_path, id_vetor,specific_person_id_nonorm,id_thres, swap_mod
 
     clips.write_videofile(save_path,audio_codec='aac')
 
+
+def video_swap_with_attack(video_path, img_id,latent_id, specific_person_id_nonorm, id_thres, swap_model, detect_model, save_path,
+                           temp_results_dir='./temp_results', crop_size=224, no_simswaplogo=False, use_mask=False, epsilon=0.07, iter=100):
+    video = cv2.VideoCapture(video_path)
+    fps = video.get(cv2.CAP_PROP_FPS)
+    frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+    spNorm = SpecificNorm()
+    mse = torch.nn.MSELoss().cuda()
+
+    logoclass = watermark_image('./simswaplogo/simswaplogo.png')
+
+    if use_mask:
+        n_classes = 19
+        net = BiSeNet(n_classes=n_classes)
+        net.cuda()
+        save_pth = os.path.join('./parsing_model/checkpoint', '79999_iter.pth')
+        net.load_state_dict(torch.load(save_pth))
+        net.eval()
+    else:
+        net =None
+
+    os.makedirs(temp_results_dir, exist_ok=True)
+    for frame_index in tqdm(range(frame_count)):
+        ret, frame = video.read()
+        if not ret:
+            break
+
+        detect_results = detect_model.get(frame, crop_size)
+        if detect_results is None:
+            continue
+
+        frame_align_crop_list, frame_mat_list = detect_results
+        frame_align_crop_tensor_list = []
+        id_compare_values = []
+
+        for frame_align_crop in frame_align_crop_list:
+            frame_align_crop_tensor = _totensor(cv2.cvtColor(frame_align_crop, cv2.COLOR_BGR2RGB))[None, ...].cuda()
+            frame_align_crop_tensor_arcnorm = spNorm(frame_align_crop_tensor)
+            frame_align_crop_tensor_arcnorm_downsample = F.interpolate(frame_align_crop_tensor_arcnorm, size=(112, 112))
+            frame_id_nonorm = swap_model.netArc(frame_align_crop_tensor_arcnorm_downsample)
+            id_compare_values.append(mse(frame_id_nonorm, specific_person_id_nonorm).detach().cpu().numpy())
+            frame_align_crop_tensor_list.append(frame_align_crop_tensor)
+
+        id_compare_values_array = np.array(id_compare_values)
+        min_index = np.argmin(id_compare_values_array)
+        min_value = id_compare_values_array[min_index]
+
+        if min_value < id_thres:
+            adv_frame_batch = lab_attack_faceswap_video(img_id, frame_align_crop_tensor_list[min_index],
+                                                        swap_model, epsilon, iter, temp_results_dir)
+            swap_result = swap_model(None, adv_frame_batch, latent_id, None, True)[0]
+
+            # Save swap_result as PNG/JPG
+            swap_result_np = swap_result.detach().cpu().permute(1, 2, 0).numpy()  # Convert to NumPy (H, W, C)
+            swap_result_np = (swap_result_np - swap_result_np.min()) / (swap_result_np.max() - swap_result_np.min()) * 255  # Normalize to [0, 255]
+            swap_result_np = swap_result_np.astype(np.uint8)  # Convert to uint8
+            
+            # Save using OpenCV
+            cv2.imwrite(os.path.join(temp_results_dir, f"swap_result_{frame_index:07d}.jpg"),
+                        cv2.cvtColor(swap_result_np, cv2.COLOR_RGB2BGR))  # Convert RGB to BGR for OpenCV
+    
+            reverse2wholeimage([frame_align_crop_tensor_list[min_index]], [swap_result], [frame_mat_list[min_index]], crop_size, frame, logoclass,\
+                        os.path.join(temp_results_dir, 'frame_{:0>7d}.jpg'.format(frame_index)),no_simswaplogo,pasring_model =net,use_mask= use_mask, norm = spNorm)
+        else:
+            cv2.imwrite(os.path.join(temp_results_dir, f"frame_{frame_index:07d}.jpg"), frame)
+
+    video.release()
+
+    image_filenames = sorted(glob.glob(os.path.join(temp_results_dir, '*.jpg')))
+    clips = ImageSequenceClip(image_filenames, fps=fps)
+    clips.write_videofile(save_path, audio_codec='aac')
